@@ -1,0 +1,12 @@
+{
+  "name": "funnelhunter-proxy",
+  "version": "1.0.0",
+  "description": "FunnelHunter API proxy — keeps your Anthropic key off the browser",
+  "main": "proxy-server.js",
+  "scripts": {
+    "start": "node proxy-server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
