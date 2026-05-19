@@ -5,6 +5,7 @@
 //   SUPABASE_ANON_KEY       = eyJ...
 //   SUPABASE_SERVICE_KEY    = eyJ... (admin)
 //   STRIPE_WEBHOOK_SECRET   = whsec_...
+//   STRIPE_SECRET_KEY       = sk_live_... (needed to fetch customer email)
 
 const https  = require('https');
 const http   = require('http');
@@ -13,20 +14,39 @@ const crypto = require('crypto');
 const PORT           = process.env.PORT || 3001;
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY     || '';
 const SUPABASE_URL   = process.env.SUPABASE_URL          || '';
-const SUPABASE_ANON  = process.env.SUPABASE_ANON_KEY     || '';
 const SUPABASE_SVC   = process.env.SUPABASE_SERVICE_KEY  || '';
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_KEY     = process.env.STRIPE_SECRET_KEY     || '';
 
-console.log('Starting FunnelHunter proxy...');
-console.log('Anthropic key:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
-console.log('Supabase URL:', SUPABASE_URL ? 'SET' : 'MISSING');
-console.log('Supabase service key:', SUPABASE_SVC ? 'SET' : 'MISSING');
-console.log('Webhook secret:', WEBHOOK_SECRET ? 'SET' : 'MISSING');
+console.log('Proxy starting...');
+console.log('Anthropic:', !!ANTHROPIC_KEY, '| Supabase:', !!SUPABASE_SVC, '| Webhook:', !!WEBHOOK_SECRET, '| Stripe:', !!STRIPE_KEY);
+
+// ── Fetch customer email from Stripe ───────────────────
+function getStripeCustomer(customerId) {
+  return new Promise((resolve) => {
+    if (!STRIPE_KEY || !customerId) { resolve(null); return; }
+    const opts = {
+      hostname: 'api.stripe.com',
+      path: '/v1/customers/' + customerId,
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + STRIPE_KEY }
+    };
+    const req = https.request(opts, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(d)); }
+        catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
 
 // ── Supabase REST helper ───────────────────────────────
-function sbReq(method, path, body, svc) {
+function sbReq(method, path, body) {
   return new Promise((resolve, reject) => {
-    const key     = svc ? SUPABASE_SVC : SUPABASE_ANON;
     const url     = new URL(SUPABASE_URL + path);
     const payload = body ? JSON.stringify(body) : null;
     const opts    = {
@@ -34,8 +54,8 @@ function sbReq(method, path, body, svc) {
       path:     url.pathname + url.search,
       method,
       headers: {
-        'apikey':        key,
-        'Authorization': 'Bearer ' + key,
+        'apikey':        SUPABASE_SVC,
+        'Authorization': 'Bearer ' + SUPABASE_SVC,
         'Content-Type':  'application/json',
         'Prefer':        'return=minimal',
       }
@@ -58,9 +78,8 @@ function sbReq(method, path, body, svc) {
 // ── Find user ID by email ──────────────────────────────
 async function getUserIdByEmail(email) {
   try {
-    const r = await sbReq('GET',
-      `/auth/v1/admin/users?email=${encodeURIComponent(email)}`, null, true);
-    console.log('User lookup status:', r.status, 'body:', JSON.stringify(r.body).slice(0,200));
+    const r = await sbReq('GET', `/auth/v1/admin/users?email=${encodeURIComponent(email)}`);
+    console.log('User lookup for', email, '- status:', r.status, '- found:', r.body?.users?.length || 0);
     return r.body?.users?.[0]?.id || null;
   } catch(e) {
     console.error('getUserIdByEmail error:', e.message);
@@ -70,16 +89,17 @@ async function getUserIdByEmail(email) {
 
 // ── Set user plan ──────────────────────────────────────
 async function setPlan(email, plan) {
-  console.log(`Setting plan: ${email} -> ${plan}`);
+  console.log(`setPlan: ${email} -> ${plan}`);
   const userId = await getUserIdByEmail(email);
-  if (!userId) { console.warn('No user ID found for:', email); return; }
+  if (!userId) { console.warn('User not found:', email); return; }
   const r = await sbReq('PATCH',
     `/rest/v1/profiles?id=eq.${userId}`,
-    { plan, searches_used: 0, updated_at: new Date().toISOString() }, true);
-  console.log('Plan update status:', r.status);
+    { plan, searches_used: 0, updated_at: new Date().toISOString() }
+  );
+  console.log('Plan updated - status:', r.status);
 }
 
-// ── Map Stripe amount to plan ──────────────────────────
+// ── Map amount to plan ─────────────────────────────────
 function planFromAmount(cents) {
   if (cents >= 24700) return 'agency';
   if (cents >= 9700)  return 'pro';
@@ -93,35 +113,77 @@ function verifyStripe(rawBody, sig, secret) {
     const ts  = sig.split(',').find(p => p.startsWith('t=')).slice(2);
     const v1  = sig.split(',').find(p => p.startsWith('v1=')).slice(3);
     const exp = crypto.createHmac('sha256', secret)
-                      .update(ts + '.' + rawBody)
-                      .digest('hex');
+                      .update(ts + '.' + rawBody).digest('hex');
     return crypto.timingSafeEqual(Buffer.from(v1), Buffer.from(exp));
   } catch(e) {
-    console.error('Signature verify error:', e.message);
+    console.error('verifyStripe error:', e.message);
     return false;
   }
 }
 
-// ── Server ─────────────────────────────────────────────
-http.createServer((req, res) => {
+// ── Handle Stripe event ────────────────────────────────
+async function handleStripeEvent(event) {
+  const obj    = event.data?.object;
+  const type   = event.type;
+  console.log('Handling event:', type);
 
+  if (type === 'customer.subscription.created' ||
+      type === 'customer.subscription.updated') {
+    const status   = obj?.status;
+    const custId   = obj?.customer;
+    const amount   = obj?.items?.data?.[0]?.price?.unit_amount || 0;
+
+    // Get email — try subscription first, then fetch from Stripe
+    let email = obj?.customer_email || obj?.metadata?.email;
+    if (!email && custId) {
+      console.log('Fetching customer from Stripe:', custId);
+      const cust = await getStripeCustomer(custId);
+      email = cust?.email;
+      console.log('Customer email from Stripe:', email);
+    }
+
+    if (!email) { console.warn('No email found for subscription event'); return; }
+
+    if (status === 'active' || status === 'trialing') {
+      await setPlan(email, planFromAmount(amount));
+    } else if (status === 'canceled' || status === 'unpaid') {
+      await setPlan(email, 'free');
+    } else {
+      console.log('Unhandled status:', status);
+    }
+  }
+
+  if (type === 'customer.subscription.deleted') {
+    const custId = obj?.customer;
+    let email = obj?.customer_email || obj?.metadata?.email;
+    if (!email && custId) {
+      const cust = await getStripeCustomer(custId);
+      email = cust?.email;
+    }
+    if (email) await setPlan(email, 'free');
+  }
+
+  if (type === 'invoice.payment_succeeded') {
+    console.log('Payment succeeded - subscription events handle the plan upgrade');
+  }
+}
+
+// ── Main server ────────────────────────────────────────
+http.createServer((req, res) => {
   const cors = {
     'Access-Control-Allow-Origin':  '*',
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, anthropic-version, stripe-signature',
   };
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, cors); res.end(); return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
 
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, anthropic: !!ANTHROPIC_KEY, supabase: !!SUPABASE_SVC, webhook: !!WEBHOOK_SECRET }));
+    res.end(JSON.stringify({ ok: true, anthropic: !!ANTHROPIC_KEY, supabase: !!SUPABASE_SVC, stripe: !!STRIPE_KEY }));
     return;
   }
 
-  // Collect body
   const chunks = [];
   req.on('data', c => chunks.push(c));
   req.on('end', async () => {
@@ -131,69 +193,22 @@ http.createServer((req, res) => {
     // ── Stripe Webhook ──────────────────────────────
     if (req.method === 'POST' && req.url === '/webhook') {
       const sig = req.headers['stripe-signature'] || '';
-      console.log('Webhook received, sig present:', !!sig, 'secret present:', !!WEBHOOK_SECRET);
-
       if (!sig || !WEBHOOK_SECRET) {
         console.error('Missing sig or secret');
         res.writeHead(400, cors); res.end('Missing signature'); return;
       }
-
       if (!verifyStripe(bodyStr, sig, WEBHOOK_SECRET)) {
-        console.error('Signature invalid');
+        console.error('Invalid signature');
         res.writeHead(400, cors); res.end('Invalid signature'); return;
       }
-
       let event;
       try { event = JSON.parse(bodyStr); }
-      catch(e) { res.writeHead(400, cors); res.end('Bad JSON'); return; }
+      catch { res.writeHead(400, cors); res.end('Bad JSON'); return; }
 
-      console.log('Stripe event type:', event.type);
-      const obj = event.data?.object;
-
-      try {
-        if (event.type === 'customer.subscription.created' ||
-            event.type === 'customer.subscription.updated') {
-          const status = obj?.status;
-          const amount = obj?.items?.data?.[0]?.price?.unit_amount || 0;
-          // Get customer email from Stripe customer object
-          const custId = obj?.customer;
-          let email = obj?.customer_email || obj?.metadata?.email;
-
-          // If no email directly, fetch from Stripe
-          if (!email && custId) {
-            await new Promise((resolve) => {
-              const r = https.get(
-                `https://api.stripe.com/v1/customers/${custId}`,
-                { headers: { 'Authorization': 'Bearer ' + ANTHROPIC_KEY } },
-                () => resolve()
-              );
-              r.on('error', () => resolve());
-            });
-          }
-
-          console.log('Sub event - status:', status, 'email:', email, 'amount:', amount);
-
-          if (email) {
-            if (status === 'active' || status === 'trialing') {
-              await setPlan(email, planFromAmount(amount));
-            } else if (status === 'canceled' || status === 'unpaid') {
-              await setPlan(email, 'free');
-            }
-          } else {
-            console.warn('No email found in subscription event');
-          }
-        }
-
-        if (event.type === 'customer.subscription.deleted') {
-          const email = obj?.customer_email || obj?.metadata?.email;
-          if (email) await setPlan(email, 'free');
-        }
-
-      } catch(e) {
-        console.error('Webhook handler error:', e.message);
-      }
-
-      res.writeHead(200, cors); res.end('ok'); return;
+      // Respond to Stripe immediately, then process async
+      res.writeHead(200, cors); res.end('ok');
+      handleStripeEvent(event).catch(e => console.error('Event handler error:', e.message));
+      return;
     }
 
     // ── Claude Proxy ────────────────────────────────
