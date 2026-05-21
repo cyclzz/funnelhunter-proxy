@@ -87,11 +87,62 @@ async function getUserIdByEmail(email) {
   }
 }
 
-// ── Set user plan ──────────────────────────────────────
+// ── Create Supabase user if they don't exist ───────────
+async function createUserIfNeeded(email, plan) {
+  // Check if user exists
+  const existingId = await getUserIdByEmail(email);
+  if (existingId) {
+    console.log('User exists, upgrading plan:', email);
+    return existingId;
+  }
+
+  // Create new user with temporary password
+  const tempPassword = 'FH-' + Math.random().toString(36).slice(2, 10).toUpperCase() + '!';
+  console.log('Creating new Supabase user for:', email);
+
+  try {
+    const r = await sbReq('POST', '/auth/v1/admin/users', {
+      email,
+      password: tempPassword,
+      email_confirm: true,
+      user_metadata: { plan, created_via: 'stripe_webhook' }
+    });
+    console.log('User creation status:', r.status, 'id:', r.body?.id);
+
+    if (r.body?.id) {
+      // Create profile row
+      await sbReq('POST', '/rest/v1/profiles', {
+        id: r.body.id,
+        plan,
+        searches_used: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+      console.log('✓ Profile created for', email);
+
+      // Send password reset email so they can set their own password
+      await sbReq('POST', '/auth/v1/admin/generate_link', {
+        type: 'recovery',
+        email,
+        options: { redirect_to: 'https://funnelhunter.netlify.app' }
+      });
+      console.log('✓ Password setup email sent to', email);
+    }
+    return r.body?.id || null;
+  } catch(e) {
+    console.error('createUserIfNeeded error:', e.message);
+    return null;
+  }
+}
+
+// ── Set user plan (creates user if needed) ─────────────
 async function setPlan(email, plan) {
   console.log(`setPlan: ${email} -> ${plan}`);
-  const userId = await getUserIdByEmail(email);
-  if (!userId) { console.warn('User not found:', email); return; }
+
+  // Create user if they don't exist (new CF purchase)
+  const userId = await createUserIfNeeded(email, plan);
+  if (!userId) { console.warn('Could not find or create user:', email); return; }
+
   const r = await sbReq('PATCH',
     `/rest/v1/profiles?id=eq.${userId}`,
     { plan, searches_used: 0, updated_at: new Date().toISOString() }
@@ -166,12 +217,35 @@ async function handleStripeEvent(event) {
   if (type === 'invoice.payment_succeeded') {
     console.log('Payment succeeded - subscription events handle the plan upgrade');
   }
+
+  // checkout.session.completed — backup to ensure user exists on first payment
+  if (type === 'checkout.session.completed') {
+    const email  = obj?.customer_email || obj?.customer_details?.email;
+    const custId = obj?.customer;
+    let finalEmail = email;
+    if (!finalEmail && custId) {
+      const cust = await getStripeCustomer(custId);
+      finalEmail = cust?.email;
+    }
+    if (finalEmail) {
+      console.log('Checkout completed for:', finalEmail);
+      await createUserIfNeeded(finalEmail, 'trial');
+    }
+  }
 }
 
 // ── Main server ────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://funnelhunter.netlify.app',
+  'https://dcstone.myclickfunnels.com',
+];
+
 http.createServer((req, res) => {
+  const origin = req.headers.origin || '';
+  const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
   const cors = {
-    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Origin':  allowedOrigin,
+    'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, anthropic-version, stripe-signature',
   };
