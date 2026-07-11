@@ -145,7 +145,7 @@ async function setPlan(email, plan) {
 
   const r = await sbReq('PATCH',
     `/rest/v1/profiles?id=eq.${userId}`,
-    { plan, searches_used: 0, updated_at: new Date().toISOString() }
+    { plan, searches_used: 0, audits_used: 0, pitches_used: 0, updated_at: new Date().toISOString() }
   );
   console.log('Plan updated - status:', r.status);
 }
@@ -207,6 +207,10 @@ async function handleStripeEvent(event) {
       await setPlan(email, 'trial');
     } else if (status === 'active') {
       await setPlan(email, planFromAmount(amount));
+    } else if (status === 'past_due') {
+      // Card declined but Stripe is still retrying (grace period, by design).
+      // Access stays as-is — no plan change. Logged for support visibility.
+      console.log(`Payment past_due for ${email} — Stripe is retrying, access unchanged.`);
     } else if (status === 'canceled' || status === 'unpaid') {
       await setPlan(email, 'free');
     } else {
@@ -224,8 +228,46 @@ async function handleStripeEvent(event) {
     if (email) await setPlan(email, 'free');
   }
 
+  // invoice.payment_succeeded — resets usage counters on renewal.
+  // billing_reason tells us WHY the invoice was created:
+  //   'subscription_create' = first payment (counters already 0, no-op)
+  //   'subscription_cycle'  = monthly renewal — this is what resets usage
+  //   'subscription_update' = plan change (setPlan already resets counters)
   if (type === 'invoice.payment_succeeded') {
-    console.log('Payment succeeded - subscription events handle the plan upgrade');
+    const billingReason = obj?.billing_reason;
+    const custId = obj?.customer;
+    let email = obj?.customer_email;
+    if (!email && custId) {
+      const cust = await getStripeCustomer(custId);
+      email = cust?.email;
+    }
+    console.log(`Payment succeeded for ${email || custId} (billing_reason=${billingReason})`);
+
+    if (email && billingReason === 'subscription_cycle') {
+      const userId = await getUserIdByEmail(email);
+      if (userId) {
+        await sbReq('PATCH', `/rest/v1/profiles?id=eq.${userId}`,
+          { searches_used: 0, audits_used: 0, pitches_used: 0, updated_at: new Date().toISOString() });
+        console.log(`✓ Usage counters reset for ${email} (new billing cycle)`);
+      } else {
+        console.warn('Renewal payment succeeded but no matching user found for', email);
+      }
+    }
+  }
+
+  // invoice.payment_failed — card declined. Per business decision, access
+  // stays live during Stripe's automatic retry window (past_due status),
+  // so this handler only logs for support visibility. No plan change here;
+  // if Stripe exhausts retries, customer.subscription.updated will fire
+  // with status 'canceled' or 'unpaid' and setPlan(email, 'free') runs then.
+  if (type === 'invoice.payment_failed') {
+    const custId = obj?.customer;
+    let email = obj?.customer_email;
+    if (!email && custId) {
+      const cust = await getStripeCustomer(custId);
+      email = cust?.email;
+    }
+    console.warn(`⚠ Payment FAILED for ${email || custId} — Stripe will retry automatically. Access unchanged.`);
   }
 
   // checkout.session.completed — backup to ensure user exists on first payment
