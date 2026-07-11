@@ -151,6 +151,11 @@ async function setPlan(email, plan) {
 }
 
 // ── Map amount to plan ─────────────────────────────────
+// NOTE: Only used for non-trialing subscriptions. Trial subscriptions are
+// identified by status (see handleStripeEvent), not amount, because the
+// Trial plan's recurring rate ($97/mo after the $1 intro period) is
+// identical to the Pro plan's rate. Relying on amount alone would upgrade
+// every $1 trial signup to 'pro' from the very first webhook event.
 function planFromAmount(cents) {
   if (cents >= 24700) return 'agency';
   if (cents >= 9700)  return 'pro';
@@ -195,7 +200,12 @@ async function handleStripeEvent(event) {
 
     if (!email) { console.warn('No email found for subscription event'); return; }
 
-    if (status === 'active' || status === 'trialing') {
+    if (status === 'trialing') {
+      // Trial and Pro share the same $97/mo recurring price, so amount
+      // can't distinguish them. Status is the only reliable signal while
+      // the subscription is still in its trial period.
+      await setPlan(email, 'trial');
+    } else if (status === 'active') {
       await setPlan(email, planFromAmount(amount));
     } else if (status === 'canceled' || status === 'unpaid') {
       await setPlan(email, 'free');
